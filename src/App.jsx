@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import ReactFlow, {
-  useNodesState, useEdgesState, Background, Controls, MiniMap, MarkerType
+  useNodesState, useEdgesState, Background, Controls, MiniMap, MarkerType, useReactFlow
 } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { getAIResponse } from './llmService';
@@ -19,60 +19,112 @@ export default function App() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [collapsedNodes, setCollapsedNodes] = useState(new Set());
+  const { fitView, setCenter } = useReactFlow();
 
-  // Load from Memory
+  // Focus and Context Menu State
+  const [focusedNodeId, setFocusedNodeId] = useState(null);
+  const [contextMenu, setContextMenu] = useState(null);
+
+  // Load from Memory — collapse everything to root on refresh for a clean view
   useEffect(() => {
     const saved = localStorage.getItem('ai_graph_memory');
     if (saved) {
       try {
         const { nodes: n, edges: e } = JSON.parse(saved);
-        if (Array.isArray(n) && Array.isArray(e)) {
-          setNodes(n);
+        if (Array.isArray(n) && Array.isArray(e) && n.length > 0) {
+          // Find all nodes that have children (i.e. are a source of at least one edge)
+          const parentIds = new Set(e.map(edge => edge.source));
+          // Collapse every parent node so only the root is visible
+          const initialCollapsed = new Set();
+          parentIds.forEach(id => initialCollapsed.add(id));
+
+          const hiddenOnLoad = getHiddenIds(initialCollapsed, e);
+          const { nodes: layoutedNodes } = getLayoutedElements(n, e, hiddenOnLoad);
+
+          setNodes(layoutedNodes);
           setEdges(e);
+          setCollapsedNodes(initialCollapsed);
+
+          // Center on root after a tick
+          setTimeout(() => {
+            fitView({ duration: 600, padding: 0.3, maxZoom: 1.2 });
+          }, 100);
         }
       } catch (err) {
         console.error("Failed to load memory:", err);
-        localStorage.removeItem('ai_graph_memory'); // Clear bad data
+        localStorage.removeItem('ai_graph_memory');
       }
     }
-  }, [setNodes, setEdges]);
-
-  const toggleChildren = useCallback((nodeId) => {
-    setCollapsedNodes(prev => {
-      const next = new Set(prev);
-      if (next.has(nodeId)) next.delete(nodeId);
-      else next.add(nodeId);
-      return next;
-    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Derived state for hidden nodes/edges to avoid infinite loops
-  const hiddenIds = useMemo(() => {
+  const getHiddenIds = useCallback((collapsedSet, currentEdges) => {
     const ids = new Set();
     const checkHidden = (parentId) => {
-      edges.forEach(edge => {
+      currentEdges.forEach(edge => {
         if (edge.source === parentId) {
           ids.add(edge.target);
           checkHidden(edge.target);
         }
       });
     };
-    collapsedNodes.forEach(id => checkHidden(id));
+    collapsedSet.forEach(id => checkHidden(id));
     return ids;
-  }, [collapsedNodes, edges]);
+  }, []);
 
-  // Automatically re-layout when nodes are expanded/collapsed to ensure compact spacing
+  // Track the last toggled node for camera framing
+  const [lastToggledNode, setLastToggledNode] = useState(null);
+
+  const toggleChildren = useCallback((nodeId) => {
+    setCollapsedNodes(prev => {
+      const next = new Set(prev);
+      if (next.has(nodeId)) {
+        next.delete(nodeId); // expanding
+        setLastToggledNode({ id: nodeId, action: 'expand' });
+      } else {
+        next.add(nodeId); // collapsing
+        setLastToggledNode({ id: nodeId, action: 'collapse' });
+      }
+      return next;
+    });
+  }, []);
+
+  // Re-layout whenever collapsedNodes changes — uses LATEST nodes and edges from state
   useEffect(() => {
-    if (nodes.length > 0) {
-      const { nodes: lNodes } = getLayoutedElements(nodes, edges);
-      // Only update if positions actually changed to avoid jitter
-      setNodes(nds => nds.map(n => {
-        const ln = lNodes.find(node => node.id === n.id);
-        return ln ? { ...n, position: ln.position } : n;
-      }));
+    if (nodes.length === 0) return;
+    const currentHiddenIds = getHiddenIds(collapsedNodes, edges);
+    const { nodes: layoutedNodes } = getLayoutedElements(nodes, edges, currentHiddenIds);
+
+    // Only update if positions actually changed to avoid infinite loop
+    const positionsChanged = layoutedNodes.some((ln, i) => {
+      const orig = nodes[i];
+      return !orig || ln.position.x !== orig.position.x || ln.position.y !== orig.position.y;
+    });
+
+    if (positionsChanged) {
+      setNodes(layoutedNodes);
+    }
+
+    // Camera framing for the last toggled node
+    if (lastToggledNode) {
+      setTimeout(() => {
+        if (lastToggledNode.action === 'expand') {
+          const childrenIds = edges
+            .filter(e => e.source === lastToggledNode.id && !currentHiddenIds.has(e.target))
+            .map(e => ({ id: e.target }));
+          const nodesToFrame = [{ id: lastToggledNode.id }, ...childrenIds];
+          fitView({ nodes: nodesToFrame, duration: 800, padding: 0.2, maxZoom: 1 });
+        } else {
+          fitView({ nodes: [{ id: lastToggledNode.id }], duration: 600, padding: 0.2, maxZoom: 1 });
+        }
+        setLastToggledNode(null);
+      }, 150);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collapsedNodes]);
+
+  // Derived state for hidden nodes/edges
+  const hiddenIds = useMemo(() => getHiddenIds(collapsedNodes, edges), [collapsedNodes, edges, getHiddenIds]);
 
   const onExpand = useCallback(async (topic, parentId = null) => {
     if (!topic.trim()) return;
@@ -102,7 +154,7 @@ export default function App() {
             onToggleChildren: toggleChildren,
             childCount: data.children?.length || 0
           },
-          position: { x: 0, y: 0 }
+          position: { x: 0, y: 0 },
         };
         nodesToAdd.push(rootNode);
 
@@ -127,6 +179,7 @@ export default function App() {
               id: `e-${rootId}-${l1Id}`,
               source: rootId,
               target: l1Id,
+              type: 'smoothstep',
               animated: true,
               markerEnd: { type: MarkerType.ArrowClosed, color: '#3b82f6' }
             });
@@ -149,6 +202,7 @@ export default function App() {
                   id: `e-${l1Id}-${l2Id}`,
                   source: l1Id,
                   target: l2Id,
+                  type: 'smoothstep',
                   animated: true,
                   markerEnd: { type: MarkerType.ArrowClosed, color: '#3b82f6' }
                 });
@@ -176,13 +230,14 @@ export default function App() {
               onToggleChildren: toggleChildren,
               childCount: n.children?.length || 0
             },
-            position: { x: parentPos.x + 50, y: parentPos.y } // Offset slightly to the right
+            position: { x: parentPos.x, y: parentPos.y }, // Spawn exactly at parent for outward expansion
           });
 
           edgesToAdd.push({
             id: `e-${parentId}-${l1Id}`,
             source: parentId,
             target: l1Id,
+            type: 'smoothstep',
             animated: true,
             markerEnd: { type: MarkerType.ArrowClosed, color: '#3b82f6' }
           });
@@ -200,12 +255,13 @@ export default function App() {
                   level: parentLevel + 2,
                   onToggleChildren: toggleChildren
                 },
-                position: { x: parentPos.x + 100, y: parentPos.y } // Nested offset
+                position: { x: parentPos.x, y: parentPos.y }, // Nested offset spawns exactly at parent
               });
               edgesToAdd.push({
                 id: `e-${l1Id}-${l2Id}`,
                 source: l1Id,
                 target: l2Id,
+                type: 'smoothstep',
                 animated: true,
                 markerEnd: { type: MarkerType.ArrowClosed, color: '#3b82f6' }
               });
@@ -224,51 +280,49 @@ export default function App() {
       const allNodes = [...nodes, ...nodesToAdd];
       const allEdges = [...edges, ...edgesToAdd];
 
-      // Calculate visibility for layout
-      const testHiddenIds = new Set();
-      const checkHidden = (pId, currentEdges) => {
-        currentEdges.forEach(e => {
-          if (e.source === pId) {
-            testHiddenIds.add(e.target);
-            checkHidden(e.target, currentEdges);
-          }
-        });
-      };
-
       const tempCollapsed = new Set(collapsedNodes);
       if (!parentId && data?.root) {
         const rootId = nodesToAdd[0]?.id;
         if (rootId) tempCollapsed.add(rootId);
         nodesToAdd.filter(n => n.id.startsWith('l1')).forEach(n => tempCollapsed.add(n.id));
       } else if (parentId) {
-        // If expanding an existing node, it's no longer collapsed
         tempCollapsed.delete(parentId);
       }
 
-      tempCollapsed.forEach(id => checkHidden(id, allEdges));
+      const nextHiddenIds = getHiddenIds(tempCollapsed, allEdges);
+      const { nodes: layoutedNodes } = getLayoutedElements(allNodes, allEdges, nextHiddenIds);
 
-      const visibleNodesSubset = allNodes.filter(n => !testHiddenIds.has(n.id));
-      const visibleEdgesSubset = allEdges.filter(e => !testHiddenIds.has(e.target) && !testHiddenIds.has(e.source));
-
-      const { nodes: lNodes } = getLayoutedElements(visibleNodesSubset, visibleEdgesSubset);
-
-      // Merge positions BACK into the full node set
-      const updatedNodes = allNodes.map(n => {
-        const layouted = lNodes.find(ln => ln.id === n.id);
-        if (layouted) return { ...n, position: layouted.position };
-
-        // If hidden, move to parent's position (or near it) for a compact 'cluster'
-        const parentEdge = allEdges.find(e => e.target === n.id);
-        if (parentEdge) {
-          const parent = lNodes.find(ln => ln.id === parentEdge.source);
-          if (parent) return { ...n, position: { ...parent.position } };
+      // UPDATE childCount on parent and set final positions
+      const finalNodes = layoutedNodes.map(n => {
+        if (parentId && n.id === parentId) {
+          return {
+            ...n,
+            data: {
+              ...n.data,
+              childCount: (n.data.childCount || 0) + data.nodes.length
+            }
+          };
         }
         return n;
       });
 
-      setNodes(updatedNodes);
+      setCollapsedNodes(tempCollapsed);
+      setNodes(finalNodes);
       setEdges(allEdges);
-      localStorage.setItem('ai_graph_memory', JSON.stringify({ nodes: updatedNodes, edges: allEdges }));
+      localStorage.setItem('ai_graph_memory', JSON.stringify({ nodes: finalNodes, edges: allEdges }));
+
+      // Smooth camera shift to frame the parent and newly expanded children
+      setTimeout(() => {
+        if (parentId) {
+          const nodesToFrame = [{ id: parentId }, ...nodesToAdd.map(n => ({ id: n.id }))];
+          fitView({ nodes: nodesToFrame, duration: 800, padding: 0.2, maxZoom: 1.2 });
+        } else {
+          // Frame main cluster on root generation
+          const nodesToFrame = nodesToAdd.map(n => ({ id: n.id }));
+          fitView({ nodes: nodesToFrame, duration: 800, padding: 0.2, maxZoom: 1.2 });
+        }
+      }, 150); // slight delay to ensure React Flow has mounted the new coordinates
+
     } catch (error) {
       console.error("Expansion error:", error);
     } finally {
@@ -278,24 +332,98 @@ export default function App() {
   }, [nodes, edges, setNodes, setEdges, toggleChildren, collapsedNodes]);
 
   const visibleNodes = useMemo(() => {
-    return nodes.map(node => ({
-      ...node,
-      hidden: hiddenIds.has(node.id),
-      data: {
-        ...node.data,
-        isCollapsed: collapsedNodes.has(node.id),
-        onToggleChildren: toggleChildren,
-        onExpand: onExpand
-      }
-    }));
-  }, [nodes, hiddenIds, collapsedNodes, toggleChildren, onExpand]);
+    // If there's a focused node, calculate its ancestors and descendants
+    const connectedIds = new Set();
+    if (focusedNodeId) {
+      connectedIds.add(focusedNodeId);
+      // Find descendants
+      const getDescendants = (id) => {
+        edges.forEach(e => {
+          if (e.source === id && !connectedIds.has(e.target)) {
+            connectedIds.add(e.target);
+            getDescendants(e.target);
+          }
+        });
+      };
+      // Find ancestors
+      const getAncestors = (id) => {
+        edges.forEach(e => {
+          if (e.target === id && !connectedIds.has(e.source)) {
+            connectedIds.add(e.source);
+            getAncestors(e.source);
+          }
+        });
+      };
+      getDescendants(focusedNodeId);
+      getAncestors(focusedNodeId);
+    }
+
+    return nodes.map(node => {
+      const isHidden = hiddenIds.has(node.id);
+      const isDimmed = focusedNodeId && !connectedIds.has(node.id);
+      const isActive = node.id === focusedNodeId;
+      const isConnected = focusedNodeId && connectedIds.has(node.id) && !isActive;
+
+      let zIndex = 1;
+      if (isActive) zIndex = 1000;
+      else if (isConnected) zIndex = 500;
+
+      let cls = node.className || '';
+      if (isDimmed) cls += ' dimmed';
+      if (isActive) cls += ' active-node';
+      if (isConnected) cls += ' connected-node';
+
+      return {
+        ...node,
+        hidden: isHidden,
+        zIndex: zIndex,
+        className: cls.trim(),
+        data: {
+          ...node.data,
+          isCollapsed: collapsedNodes.has(node.id),
+          onToggleChildren: toggleChildren,
+          onExpand: onExpand
+        }
+      };
+    });
+  }, [nodes, hiddenIds, collapsedNodes, toggleChildren, onExpand, focusedNodeId, edges]);
 
   const visibleEdges = useMemo(() => {
-    return edges.map(edge => ({
-      ...edge,
-      hidden: hiddenIds.has(edge.target) || hiddenIds.has(edge.source)
-    }));
-  }, [edges, hiddenIds]);
+    // Same connection logic for edges
+    const connectedIds = new Set();
+    if (focusedNodeId) {
+      connectedIds.add(focusedNodeId);
+      const getDescendants = (id) => {
+        edges.forEach(e => {
+          if (e.source === id && !connectedIds.has(e.target)) {
+            connectedIds.add(e.target);
+            getDescendants(e.target);
+          }
+        });
+      };
+      const getAncestors = (id) => {
+        edges.forEach(e => {
+          if (e.target === id && !connectedIds.has(e.source)) {
+            connectedIds.add(e.source);
+            getAncestors(e.source);
+          }
+        });
+      };
+      getDescendants(focusedNodeId);
+      getAncestors(focusedNodeId);
+    }
+
+    return edges.map(edge => {
+      const isHidden = hiddenIds.has(edge.target) || hiddenIds.has(edge.source);
+      const isDimmed = focusedNodeId && (!connectedIds.has(edge.source) || !connectedIds.has(edge.target));
+
+      return {
+        ...edge,
+        hidden: isHidden,
+        className: isDimmed ? 'dimmed-edge' : ''
+      };
+    });
+  }, [edges, hiddenIds, focusedNodeId]);
 
   const clearGraph = useCallback(() => {
     if (window.confirm("Clear all nodes?")) {
@@ -307,20 +435,87 @@ export default function App() {
   }, [setNodes, setEdges]);
 
   const triggerLayout = useCallback(() => {
-    const { nodes: lNodes } = getLayoutedElements(nodes, edges);
+    const { nodes: lNodes } = getLayoutedElements(nodes, edges, hiddenIds);
     setNodes(lNodes);
-  }, [nodes, edges, setNodes]);
+  }, [nodes, edges, hiddenIds, setNodes]);
 
   const clearMemory = useCallback(() => {
     if (window.confirm("This will clear the saved memory and reload. Continue?")) {
       localStorage.removeItem('ai_graph_memory');
-      window.location.reload();
+      setNodes([]);
+      setEdges([]);
+      setCollapsedNodes(new Set());
     }
-  }, []);
+  }, [setNodes, setEdges, setCollapsedNodes]);
+
+  // Context Menu Handlers
+  const onNodeContextMenu = useCallback(
+    (event, node) => {
+      event.preventDefault();
+      setContextMenu({
+        id: node.id,
+        top: event.clientY,
+        left: event.clientX,
+        node: node,
+      });
+    },
+    [setContextMenu]
+  );
+
+  const onPaneClick = useCallback(() => {
+    setContextMenu(null);
+    setFocusedNodeId(null);
+  }, [setContextMenu, setFocusedNodeId]);
+
+  const onNodeClick = useCallback((event, node) => {
+    setFocusedNodeId(node.id);
+    setCenter(node.position.x, node.position.y, { duration: 400, zoom: 1 });
+  }, [setCenter]);
+
+  const handleContextMenuAction = useCallback((action) => {
+    if (!contextMenu) return;
+    const { id, node } = contextMenu;
+
+    if (action === 'expand') {
+      onExpand(node.data.label, id);
+    } else if (action === 'explain') {
+      alert(`Explanation for: ${node.data.label}\n\n${node.data.desc}\n\n(Future: Opens in dedicated side-chat)`);
+    } else if (action === 'edit') {
+      const newLabel = prompt("Edit node label:", node.data.label);
+      if (newLabel && newLabel.trim() !== '') {
+        setNodes(nds => nds.map(n => {
+          if (n.id === id) {
+            n.data = { ...n.data, label: newLabel };
+          }
+          return n;
+        }));
+      }
+    } else if (action === 'link') {
+      alert("Attach external links logic will go here.");
+    } else if (action === 'delete') {
+      // Recursive delete
+      const idsToDelete = new Set([id]);
+      const checkChildren = (parentId) => {
+        edges.forEach(e => {
+          if (e.source === parentId) {
+            idsToDelete.add(e.target);
+            checkChildren(e.target);
+          }
+        });
+      };
+      checkChildren(id);
+
+      setNodes(nds => nds.filter(n => !idsToDelete.has(n.id)));
+      setEdges(eds => eds.filter(e => !idsToDelete.has(e.source) && !idsToDelete.has(e.target)));
+      setTimeout(() => fitView({ duration: 800, padding: 0.2 }), 100);
+    }
+    setContextMenu(null);
+  }, [contextMenu, edges, onExpand, setNodes, setEdges, fitView]);
 
   return (
     <div className="app-container">
-      <header className="glass-header">
+      {nodes.length > 0 && <div className="header-hover-zone" />}
+      <header className={`glass-header ${nodes.length > 0 ? 'graph-active' : ''}`}>
         <div className="logo">
           <Cpu size={24} className="icon-glow" />
           <span>GEN-AI Graph Explorer</span>
@@ -357,7 +552,13 @@ export default function App() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
+        onNodeClick={onNodeClick}
+        onNodeContextMenu={onNodeContextMenu}
+        onPaneClick={onPaneClick}
+        nodesDraggable={true}
+        nodesConnectable={false}
         fitView
+        fitViewOptions={{ padding: 0.2, duration: 800 }}
         onNodeDragStop={() => {
           localStorage.setItem('ai_graph_memory', JSON.stringify({ nodes, edges }));
         }}
@@ -370,6 +571,19 @@ export default function App() {
         />
       </ReactFlow>
 
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{ top: contextMenu.top, left: contextMenu.left }}
+        >
+          <button onClick={() => handleContextMenuAction('expand')}>Expand Nodes</button>
+          <button onClick={() => handleContextMenuAction('explain')}>Explain in Detail</button>
+          <button onClick={() => handleContextMenuAction('edit')}>Edit Label</button>
+          <button onClick={() => handleContextMenuAction('link')}>Link Resource</button>
+          <button onClick={() => handleContextMenuAction('delete')} className="delete-action">Delete Branch</button>
+        </div>
+      )}
+
       {loading && (
         <div className="loader-container">
           <div className="loader-overlay">
@@ -381,3 +595,4 @@ export default function App() {
     </div>
   );
 }
+
